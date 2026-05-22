@@ -1,3 +1,34 @@
+# py-tdgl JAX migration requirements
+# Tested with: JAX 0.10.1, numpy 2.2.x, klujax 0.5.0
+#
+# Install:
+#   pip install -r requirements-jax.txt
+#
+# GPU (WSL2 + CUDA 12):
+#   pip install -r requirements-jax.txt
+#   pip install --upgrade "jax[cuda12]"
+
+# --- Core JAX (0.10.x supports numpy 2.x) ---
+jax>=0.10.0
+jaxlib>=0.10.0
+
+# --- Differentiable sparse direct solver ---
+klujax>=0.5.0
+
+# --- py-tdgl runtime deps ---
+tdgl>=0.8.0
+numpy>=2.0
+scipy>=1.10
+h5py>=3.8
+meshpy>=2022.1
+shapely>=2.0
+matplotlib>=3.7
+numba>=0.57
+pint>=0.21
+tqdm>=4.64
+cloudpickle>=2.2
+joblib>=1.2
+
 cloudpickle
 h5py
 joblib
