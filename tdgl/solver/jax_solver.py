@@ -19,7 +19,6 @@ Usage
 
 Phases not yet implemented here
 ---------------------------------
-  Phase 3  Differentiable Poisson solve (klujax / jax CG)
   Phase 4  jax.lax.scan / while_loop over time steps
   Phase 5  jax.vmap / jax.grad
 """
@@ -39,10 +38,15 @@ try:
     import jax
     import jax.numpy as jnp
     from jax.experimental.sparse import BCOO
+    import klujax
 
     JAX_AVAILABLE = True
 except ImportError:
     JAX_AVAILABLE = False
+
+# Enable 64-bit precision: required for complex128 psi and float64 mu/klujax
+if JAX_AVAILABLE:
+    jax.config.update("jax_enable_x64", True)
 
 from .solver import SolverResult, TDGLSolver
 from .options import SolverOptions
@@ -117,6 +121,14 @@ class JaxOperators:
         self.psi_laplacian_bcoo = BCOO(
             (jnp.array(coo_lap.data), self._lap_indices), shape=self._lap_shape
         )
+
+        # mu_laplacian COO triplets (frozen — topology never changes)
+        # Stored as JAX arrays so klujax.solve stays fully inside JAX.
+        coo_mu = ops.mu_laplacian.tocoo()
+        self._mu_lap_Ai   = jnp.array(coo_mu.row,  dtype=jnp.int32)
+        self._mu_lap_Aj   = jnp.array(coo_mu.col,  dtype=jnp.int32)
+        self._mu_lap_Ax   = jnp.array(coo_mu.data, dtype=jnp.float64)
+        self._mu_lap_shape = ops.mu_laplacian.shape
 
         # psi_gradient
         coo_grad = ops.psi_gradient.tocoo()
@@ -259,24 +271,25 @@ def solve_for_observables_jax(
     dA_dt:        Union[float, jnp.ndarray],
     mu_boundary:  jnp.ndarray,
     jax_ops:      JaxOperators,
-    mu_laplacian_lu,   # original SciPy factorised callable — Phase 3 will replace this
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """JAX port of TDGLSolver.solve_for_observables.
 
-    Supercurrent and normal-current are computed in JAX.
-    The Poisson solve (mu_laplacian_lu) still uses SciPy for now
-    (Phase 3 will replace it with klujax or jax CG).
+    Phase 3: fully inside JAX — klujax replaces the SciPy sparse LU solve.
+    The entire function is now differentiable via klujax's custom VJP.
     """
     supercurrent = jax_ops.get_supercurrent_jax(psi)
 
-    rhs_jax = (
+    rhs = (
         jax_ops.divergence_bcoo @ (supercurrent - dA_dt)
         - jax_ops.mu_boundary_lap_bcoo @ mu_boundary
     )
-    # Drop to NumPy for the SciPy sparse solve (Phase 3 removes this round-trip)
-    rhs_np = np.array(rhs_jax)
-    mu_np  = mu_laplacian_lu(rhs_np)
-    mu     = jnp.array(mu_np)
+    # Phase 3: klujax direct sparse solve — no NumPy round-trip, AD-compatible
+    mu = klujax.solve(
+        jax_ops._mu_lap_Ai,
+        jax_ops._mu_lap_Aj,
+        jax_ops._mu_lap_Ax,
+        rhs,
+    )
 
     normal_current = -(jax_ops.mu_gradient_bcoo @ mu) - dA_dt
     return mu, supercurrent, normal_current
@@ -287,14 +300,19 @@ def solve_for_observables_jax(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JaxTDGLSolver(TDGLSolver):
-    """TDGLSolver with Phase 1+2 hot methods replaced by JAX equivalents.
+    """TDGLSolver with Phase 1+2+3 hot methods replaced by JAX equivalents.
+
+    Phase 1: psi update (solve_for_psi_squared_jax)
+    Phase 2: sparse operators (BCOO psi_laplacian, divergence, gradients)
+    Phase 3: Poisson solve via klujax (differentiable, no SciPy round-trip)
 
     All initialisation, I/O, screening, and runner logic is inherited
-    unchanged from TDGLSolver.  Only adaptive_euler_step and
-    solve_for_observables are overridden.
+    unchanged from TDGLSolver.
 
     The first call to update() triggers JIT compilation (~seconds).
     Subsequent steps run the compiled kernels.
+
+    AD is now available end-to-end through the full time step.
     """
 
     def __init__(self, *args, **kwargs):
@@ -313,7 +331,7 @@ class JaxTDGLSolver(TDGLSolver):
         self._mu_boundary_jax = jnp.array(self.mu_boundary)
         self._epsilon_jax     = jnp.array(self.epsilon)
 
-        logger.info("JaxTDGLSolver initialised — Phase 1+2 active.")
+        logger.info("JaxTDGLSolver initialised — Phase 1+2+3 active (klujax Poisson solve).")
 
     # ------------------------------------------------------------------
     # Override: adaptive_euler_step
@@ -368,6 +386,5 @@ class JaxTDGLSolver(TDGLSolver):
         mu, supercurrent, normal_current = solve_for_observables_jax(
             psi_j, dA_dt_j, mu_boundary_j,
             self._jax_ops,
-            self.operators.mu_laplacian_lu,   # SciPy factorised LU (Phase 3 target)
         )
         return mu, supercurrent, normal_current
